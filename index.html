@@ -86,6 +86,7 @@ textarea{min-height:80px;resize:vertical}
 .photos .ph{position:relative;aspect-ratio:1;border-radius:10px;overflow:hidden;background:var(--line)}
 .photos img{width:100%;height:100%;object-fit:cover;display:block;cursor:pointer}
 .phx{position:absolute;top:4px;right:4px;width:26px;height:26px;border-radius:50%;border:0;background:rgba(11,37,69,.75);color:#fff;font-size:17px;line-height:1;cursor:pointer}
+.pvnav{position:absolute;top:50%;transform:translateY(-50%);width:40px;height:40px;border-radius:50%;border:0;background:rgba(11,37,69,.55);color:#fff;font-size:26px;line-height:1;cursor:pointer}
 .season{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:4px}
 .season button{border:0;border-radius:6px;height:38px;font:inherit;font-size:13px;font-weight:700;cursor:pointer;padding:0}
 .season button.cur{outline:2px solid var(--amber);outline-offset:1px}
@@ -211,44 +212,114 @@ async function gcPhotos(){
     for(const k of await PDB.keys()) if(!used.has(k)) await PDB.del(k);
   }catch(e){}
 }
-function loadImg(file){
+/* Photos : compression, stockage binaire, visionneuse */
+const PHOTO_MAX = 1280, PHOTO_Q = 0.72, THUMB_MAX = 240, THUMB_Q = 0.6;
+let liveURLs = [];
+function blobURL(x){ if(typeof x==="string") return x; const u = URL.createObjectURL(x); liveURLs.push(u); return u; }
+function freeURLs(){ liveURLs.forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} }); liveURLs = []; }
+function sizeOf(x){ if(!x) return 0; if(typeof x==="string"){ const i=x.indexOf(","); return Math.round((x.length-i-1)*0.75); } return x.size||0; }
+function fmtSize(b){ if(b<1024) return b+" o"; if(b<1048576) return Math.round(b/1024)+" Ko"; if(b<1073741824) return (b/1048576).toFixed(1).replace(".",",")+" Mo"; return (b/1073741824).toFixed(1).replace(".",",")+" Go"; }
+function loadImg(src){
   return new Promise((res,rej)=>{
-    const url = URL.createObjectURL(file); const im = new Image();
-    im.onload = ()=>{ URL.revokeObjectURL(url); res(im); };
-    im.onerror = ()=>{ URL.revokeObjectURL(url); rej(new Error("image")); };
+    const str = typeof src==="string";
+    const url = str ? src : URL.createObjectURL(src); const im = new Image();
+    im.onload = ()=>{ if(!str) URL.revokeObjectURL(url); res(im); };
+    im.onerror = ()=>{ if(!str) URL.revokeObjectURL(url); rej(new Error("image")); };
     im.src = url;
   });
 }
-function toJpeg(im, max, q){
+function drawTo(im, max){
   const r = Math.min(1, max/Math.max(im.naturalWidth, im.naturalHeight));
   const c = document.createElement("canvas");
   c.width = Math.max(1, Math.round(im.naturalWidth*r)); c.height = Math.max(1, Math.round(im.naturalHeight*r));
-  c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
-  return c.toDataURL("image/jpeg", q);
+  const g = c.getContext("2d"); g.imageSmoothingQuality = "high"; g.drawImage(im, 0, 0, c.width, c.height);
+  return c;
+}
+// WebP quand le navigateur sait l'encoder (≈30 % plus léger), sinon JPEG
+function encode(c, q){
+  return new Promise((res,rej)=>{
+    const jpeg = ()=> c.toBlob(b=> b ? res(b) : rej(new Error("encode")), "image/jpeg", q);
+    try{ c.toBlob(b=>{ if(b && b.type==="image/webp") res(b); else jpeg(); }, "image/webp", q); }catch(e){ jpeg(); }
+  });
+}
+function blobToDataURL(b){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=()=>rej(r.error); r.readAsDataURL(b); }); }
+async function makeRecord(src){
+  const im = await loadImg(src);
+  const full = await encode(drawTo(im, PHOTO_MAX), PHOTO_Q);
+  const thumb = await encode(drawTo(im, THUMB_MAX), THUMB_Q);
+  return {full, thumb, v:3};
+}
+async function storeRecord(id, rec){
+  try{ await PDB.put(id, rec); }
+  catch(e){ // très vieux navigateurs : pas de Blob dans IndexedDB
+    await PDB.put(id, {full: await blobToDataURL(rec.full), thumb: await blobToDataURL(rec.thumb), v:3});
+  }
 }
 async function addPhoto(file){
-  const im = await loadImg(file);
   const id = "p_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-  await PDB.put(id, {full: toJpeg(im, 1600, 0.78), thumb: toJpeg(im, 320, 0.7)});
+  await storeRecord(id, await makeRecord(file));
   return id;
+}
+async function photoStats(){
+  let n=0, bytes=0, legacy=0;
+  try{ for(const k of await PDB.keys()){ const r = await PDB.get(k); if(!r) continue; n++; bytes += sizeOf(r.full)+sizeOf(r.thumb); if(r.v!==3) legacy++; } }catch(e){}
+  return {n, bytes, legacy};
+}
+async function optimizeOld(onStep){
+  let before=0, after=0, done=0;
+  const keys = await PDB.keys();
+  for(const k of keys){
+    const r = await PDB.get(k); if(!r || r.v===3) continue;
+    try{
+      const nr = await makeRecord(r.full);
+      const b = sizeOf(r.full)+sizeOf(r.thumb), a = sizeOf(nr.full)+sizeOf(nr.thumb);
+      if(a < b){ await storeRecord(k, nr); before+=b; after+=a; }
+      else { await PDB.put(k, Object.assign({}, r, {v:3})); }
+    }catch(e){}
+    done++; if(onStep) onStep(done);
+  }
+  return before-after;
 }
 async function fillThumbs(root){
   for(const img of root.querySelectorAll("img[data-pid]")){
-    try{ const p = await PDB.get(img.dataset.pid); if(p) img.src = p.thumb; }catch(e){}
+    try{ const p = await PDB.get(img.dataset.pid); if(p) img.src = blobURL(p.thumb); }catch(e){}
   }
 }
-async function showPhoto(id){
-  try{
-    const p = await PDB.get(id); if(!p) return;
-    dialog(`<img src="${p.full}" alt="" style="width:100%;max-height:70vh;object-fit:contain;border-radius:10px;display:block;margin-bottom:12px"><button class="btn ghost" id="dNo">Fermer</button>`);
-    $("#dNo").onclick = closeDialog;
-  }catch(e){ toast("Photo illisible"); }
+async function showPhoto(ids, idx){
+  ids = ids.slice(); if(!ids.length) return;
+  idx = Math.max(0, Math.min(idx, ids.length-1));
+  let url = null;
+  const one = ids.length===1;
+  dialog(`<div style="position:relative">
+      <img id="pvImg" alt="" style="width:100%;height:62vh;object-fit:contain;border-radius:10px;display:block;background:#f2f5f8">
+      ${one?"":`<button class="pvnav" id="pvPrev" aria-label="Photo précédente" style="left:6px">‹</button><button class="pvnav" id="pvNext" aria-label="Photo suivante" style="right:6px">›</button>`}
+    </div>
+    <div id="pvNum" style="text-align:center;color:#a3adb8;font-size:13px;margin:8px 0 12px">&nbsp;</div>
+    <button class="btn ghost" id="dNo">Fermer</button>`);
+  const show = async ()=>{
+    $("#pvNum").textContent = `Photo ${idx+1} / ${ids.length}`;
+    try{
+      const p = await PDB.get(ids[idx]);
+      if(url && typeof url==="string" && url.startsWith("blob:")) URL.revokeObjectURL(url);
+      url = p ? (typeof p.full==="string" ? p.full : URL.createObjectURL(p.full)) : "";
+      $("#pvImg").src = url;
+    }catch(e){ toast("Photo illisible"); }
+  };
+  const step = d=>{ idx = (idx + d + ids.length) % ids.length; show(); };
+  if(!one){
+    $("#pvPrev").onclick = ()=>step(-1); $("#pvNext").onclick = ()=>step(1);
+    let x0=null; const im=$("#pvImg");
+    im.addEventListener("touchstart", e=>{ x0=e.touches[0].clientX; }, {passive:true});
+    im.addEventListener("touchend", e=>{ if(x0==null) return; const dx=e.changedTouches[0].clientX-x0; x0=null; if(Math.abs(dx)>40) step(dx<0?1:-1); });
+  }
+  $("#dNo").onclick = ()=>{ closeDialog(); if(url && url.startsWith("blob:")) URL.revokeObjectURL(url); };
+  show();
 }
 
 /* ---------- Fichiers (sauvegarde / restauration) ---------- */
 function stamp(){ const d=new Date(); return d.toISOString().slice(0,10); }
 async function shareOrDownload(content, name, mime){
-  const blob = new Blob([content], {type: mime});
+  const blob = content instanceof Blob ? content : new Blob([content], {type: mime});
   try{
     const file = new File([blob], name, {type: mime});
     if(navigator.canShare && navigator.canShare({files:[file]}) && /iPhone|iPad|Android/i.test(navigator.userAgent)){
@@ -262,12 +333,98 @@ async function shareOrDownload(content, name, mime){
   setTimeout(()=>URL.revokeObjectURL(url), 4000);
   return true;
 }
-async function backupJSON(){
-  const photos = {};
-  for(const id of entries.flatMap(e=>e.photos||[])){
-    try{ const p = await PDB.get(id); if(p) photos[id] = p; }catch(e){}
+/* ZIP minimal (sans compression : les photos sont déjà compressées) */
+const CRC_T = (()=>{ const t=new Uint32Array(256); for(let n=0;n<256;n++){ let c=n; for(let k=0;k<8;k++) c = c&1 ? 0xEDB88320^(c>>>1) : c>>>1; t[n]=c>>>0; } return t; })();
+function crc32(u8){ let c=0xFFFFFFFF; for(let i=0;i<u8.length;i++) c = CRC_T[(c^u8[i])&255]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
+function makeZip(files){
+  const enc=new TextEncoder(), parts=[], central=[]; let off=0;
+  const d=new Date(), dosT=(d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1), dosD=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate();
+  for(const f of files){
+    const nm=enc.encode(f.name), crc=crc32(f.data), sz=f.data.length;
+    const h=new DataView(new ArrayBuffer(30));
+    h.setUint32(0,0x04034b50,true); h.setUint16(4,20,true); h.setUint16(6,0x0800,true); h.setUint16(8,0,true);
+    h.setUint16(10,dosT,true); h.setUint16(12,dosD,true); h.setUint32(14,crc,true); h.setUint32(18,sz,true); h.setUint32(22,sz,true);
+    h.setUint16(26,nm.length,true); h.setUint16(28,0,true);
+    parts.push(h.buffer, nm, f.data);
+    const c=new DataView(new ArrayBuffer(46));
+    c.setUint32(0,0x02014b50,true); c.setUint16(4,20,true); c.setUint16(6,20,true); c.setUint16(8,0x0800,true); c.setUint16(10,0,true);
+    c.setUint16(12,dosT,true); c.setUint16(14,dosD,true); c.setUint32(16,crc,true); c.setUint32(20,sz,true); c.setUint32(24,sz,true);
+    c.setUint16(28,nm.length,true); c.setUint32(42,off,true);
+    central.push(c.buffer, nm);
+    off += 30+nm.length+sz;
   }
-  return JSON.stringify({app:"livre-de-bord-voile", version:2, exported:new Date().toISOString(), profile, entries, photos});
+  const cd = central.reduce((s,p)=>s+p.byteLength,0);
+  const e=new DataView(new ArrayBuffer(22));
+  e.setUint32(0,0x06054b50,true); e.setUint16(8,files.length,true); e.setUint16(10,files.length,true); e.setUint32(12,cd,true); e.setUint32(16,off,true);
+  return new Blob([...parts, ...central, e.buffer], {type:"application/zip"});
+}
+async function readZip(buf){
+  const dv=new DataView(buf), out={}, dec=new TextDecoder();
+  let e=-1;
+  for(let i=buf.byteLength-22; i>=Math.max(0,buf.byteLength-65557); i--) if(dv.getUint32(i,true)===0x06054b50){ e=i; break; }
+  if(e<0) throw new Error("zip");
+  const n=dv.getUint16(e+10,true); let p=dv.getUint32(e+16,true);
+  for(let k=0;k<n;k++){
+    if(dv.getUint32(p,true)!==0x02014b50) throw new Error("zip");
+    const method=dv.getUint16(p+10,true), csize=dv.getUint32(p+20,true), nl=dv.getUint16(p+28,true), xl=dv.getUint16(p+30,true), cl=dv.getUint16(p+32,true), lo=dv.getUint32(p+42,true);
+    const name=dec.decode(new Uint8Array(buf,p+46,nl));
+    const start=lo+30+dv.getUint16(lo+26,true)+dv.getUint16(lo+28,true);
+    let data=new Uint8Array(buf,start,csize);
+    if(!name.endsWith("/") && !name.startsWith("__MACOSX")){
+      if(method===8){
+        if(typeof DecompressionStream==="undefined") throw new Error("deflate");
+        data=new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
+      } else if(method!==0) throw new Error("zip");
+      out[name]=data;
+    }
+    p += 46+nl+xl+cl;
+  }
+  return out;
+}
+function dataURLtoBlob(s){
+  const i=s.indexOf(","), mime=(s.slice(5,i).split(";")[0])||"image/jpeg", bin=atob(s.slice(i+1));
+  const u=new Uint8Array(bin.length); for(let k=0;k<bin.length;k++) u[k]=bin.charCodeAt(k);
+  return new Blob([u],{type:mime});
+}
+function backupMeta(photoFiles){
+  return {app:"livre-de-bord-voile", version:3, exported:new Date().toISOString(), profile, entries, photoFiles};
+}
+async function backupZip(onStep){
+  const files=[], photoFiles={}; let i=0;
+  const ids=[...new Set(entries.flatMap(e=>e.photos||[]))];
+  for(const id of ids){
+    try{
+      const r=await PDB.get(id); if(!r) continue;
+      const b = typeof r.full==="string" ? dataURLtoBlob(r.full) : r.full;
+      const name = "photos/"+id+(b.type==="image/webp"?".webp":".jpg");
+      files.push({name, data:new Uint8Array(await b.arrayBuffer())});
+      photoFiles[id]=name;
+    }catch(e){}
+    if(onStep) onStep(++i, ids.length);
+  }
+  files.unshift({name:"data.json", data:new TextEncoder().encode(JSON.stringify(backupMeta(photoFiles), null, 1))});
+  return makeZip(files);
+}
+function backupLight(){ return new Blob([JSON.stringify(backupMeta({}))], {type:"application/json"}); }
+// Lit un fichier de sauvegarde (.zip v3, ou .json v2/v3) → {data, getPhoto(id), hasPhoto(id), fromZip}
+async function readBackup(file){
+  const buf = await file.arrayBuffer();
+  const head = new Uint8Array(buf.slice(0,2));
+  if(head[0]===0x50 && head[1]===0x4B){
+    const z = await readZip(buf);
+    const jn = Object.keys(z).find(n=>n==="data.json"||n.endsWith("/data.json"));
+    if(!jn) throw new Error("format");
+    const prefix = jn.slice(0, jn.length-"data.json".length);
+    const data = JSON.parse(new TextDecoder().decode(z[jn]));
+    const pf = (data.photoFiles && typeof data.photoFiles==="object") ? data.photoFiles : {};
+    const nameOf = id => typeof pf[id]==="string" && /^photos\/[\w-]+\.(jpg|webp)$/.test(pf[id]) && z[prefix+pf[id]] ? prefix+pf[id] : null;
+    return {data, fromZip:true, hasPhoto:id=>!!nameOf(id),
+      getPhoto:id=>{ const n=nameOf(id); return new Blob([z[n]], {type: n.endsWith(".webp")?"image/webp":"image/jpeg"}); }};
+  }
+  const data = JSON.parse(new TextDecoder().decode(buf));
+  const pics = (data.photos && typeof data.photos==="object") ? data.photos : {};
+  const ok = id => pics[id] && typeof pics[id].full==="string" && pics[id].full.startsWith("data:image/");
+  return {data, fromZip:false, hasPhoto:ok, getPhoto:id=>pics[id].full};
 }
 function validEntry(e){ return e && typeof e==="object" && typeof e.id==="string" && /^s_[\w-]+$/.test(e.id) && typeof e.date==="string"; }
 
@@ -297,6 +454,7 @@ function go(v){
 }
 
 function render(){
+  freeURLs();
   $("#htitle").textContent = profile.nom ? profile.nom : "Livre de bord";
   $("#hsub").textContent = profile.nom ? (profile.type||"Voilier") + (profile.port ? " · " + profile.port : "") : "Sorties de navigation à la voile";
   if(loading){ app.innerHTML = `<div class="empty">Chargement du livre de bord…</div>`; return; }
@@ -366,7 +524,7 @@ function renderDetail(){
   <div class="row"><button class="btn ghost" id="bEdit">Modifier</button><button class="btn danger" id="bDel">Supprimer</button></div>
   <button class="btn ghost" id="bBack">← Retour au journal</button>`;
   app.querySelectorAll(".card.detail").forEach(c=>{ if(!c.querySelector("dd") && !c.querySelector("p")) c.remove(); });
-  if($("#ph")){ $("#ph").querySelectorAll("img[data-pid]").forEach(i=>i.onclick=()=>showPhoto(i.dataset.pid)); fillThumbs($("#ph")); }
+  if($("#ph")){ $("#ph").querySelectorAll("img[data-pid]").forEach((i,n)=>i.onclick=()=>showPhoto(e.photos, n)); fillThumbs($("#ph")); }
   $("#bBack").onclick=()=>go("journal");
   $("#bEdit").onclick=()=>go("new");
   $("#bDel").onclick=()=>{
@@ -461,7 +619,7 @@ function renderForm(){
   const drawPhotos = ()=>{
     $("#ph").innerHTML = state.photos.map(id=>`<div class="ph"><img data-pid="${esc(id)}" alt=""><button type="button" class="phx" data-del="${esc(id)}" aria-label="Retirer la photo">×</button></div>`).join("");
     $("#ph").querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>{ state.photos = state.photos.filter(x=>x!==b.dataset.del); drawPhotos(); });
-    $("#ph").querySelectorAll("img[data-pid]").forEach(i=>i.onclick=()=>showPhoto(i.dataset.pid));
+    $("#ph").querySelectorAll("img[data-pid]").forEach((i,n)=>i.onclick=()=>showPhoto(state.photos, n));
     fillThumbs($("#ph"));
   };
   drawPhotos();
@@ -643,7 +801,7 @@ function recordCheck(c){
   };
 }
 
-/* ---------- Export ---------- */
+/* ---------- Sauvegarde ---------- */
 function renderExport(){
   const cols=["date","type","depart","retour","portDepart","destination","portArrivee","skipper","nbPers","equipage","ciel","tempAir","tempEau","visibilite","ventDir","beaufort","ventNd","rafales","mer","motSortie","motEntree","motAutre","compteur","carburant","voiles","notes","photos"];
   const csv = [cols.join(";")].concat(entries.slice().sort((a,b)=>(a.date||"").localeCompare(b.date||"")).map(e=>cols.map(c=>{
@@ -652,52 +810,97 @@ function renderExport(){
   }).join(";"))).join("\n");
   const last = lsGet("ldb_lastBackup", null);
   const days = last ? Math.floor((Date.now()-new Date(last))/86400000) : null;
+  const nPh = entries.reduce((s,e)=>s+(e.photos||[]).length,0);
   app.innerHTML = `
+    <div class="card"><div class="sec">📦 Espace de stockage</div>
+      <div id="stor" class="meta">Calcul en cours…</div>
+      <div id="optBox"></div>
+    </div>
+
     <div class="card"><div class="sec">💾 Sauvegarder</div>
-    <p style="margin:0 0 6px;font-size:14px">${entries.length} sortie(s) et la fiche du bateau dans un fichier <b>.json</b>, à garder dans iCloud Drive, Google Drive, par e-mail…</p>
+    <p style="margin:0 0 6px;font-size:14px">Fichier <b>.zip</b> avec ${entries.length} sortie(s), ${nPh} photo(s), la fiche du bateau et les historiques. Gardez-le dans iCloud Drive, Google Drive, ou envoyez-le par e-mail.</p>
     <p style="margin:0 0 12px;font-size:13px;color:${days===null||days>30?"var(--red)":"var(--muted)"}">${last ? `Dernière sauvegarde : ${fmtDate(last.slice(0,10),{day:"numeric",month:"long",year:"numeric"})}${days>30?" — pensez à en refaire une":""}` : "Aucune sauvegarde pour l'instant."}</p>
-    <button class="btn pri" id="bkp">Sauvegarder les données</button></div>
+    <button class="btn pri" id="bkp">Sauvegarder tout <span id="bkpSize" style="font-weight:400;opacity:.85"></span></button>
+    <div style="height:8px"></div>
+    <button class="btn ghost" id="bkpLight">Sauvegarde légère, sans photos</button>
+    <div class="hint" style="text-align:center">Quelques Ko seulement : pratique à envoyer par e-mail après chaque sortie.</div></div>
 
     <div class="card"><div class="sec">📥 Restaurer</div>
-    <p style="margin:0 0 12px;font-size:14px">Choisissez un fichier de sauvegarde <b>.json</b> créé par cette application (sur ce téléphone ou un autre).</p>
-    <input type="file" id="imp" accept=".json,application/json" style="display:none">
+    <p style="margin:0 0 12px;font-size:14px">Choisissez un fichier de sauvegarde (<b>.zip</b> ou <b>.json</b>) créé par cette application, sur ce téléphone ou un autre.</p>
+    <input type="file" id="imp" accept=".zip,.json,application/zip,application/json" style="display:none">
     <button class="btn ghost" id="impBtn">Choisir un fichier…</button></div>
 
     <div class="card"><div class="sec">📊 Exporter pour un tableur</div>
     <p style="margin:0 0 12px;font-size:14px">Fichier <b>CSV</b> (séparateur « ; ») à ouvrir dans Excel, Numbers ou Google Sheets. Ce fichier ne sert pas à restaurer.</p>
     <button class="btn ghost" id="csvBtn">Exporter en CSV</button></div>`;
 
+  // Espace de stockage
+  (async ()=>{
+    const st = await photoStats();
+    let quota = "";
+    try{ if(navigator.storage && navigator.storage.estimate){ const q = await navigator.storage.estimate(); if(q.quota) quota = `<div style="margin-top:4px">Espace utilisé par l'application : ${fmtSize(q.usage||0)} · disponible : ${fmtSize(Math.max(0,q.quota-(q.usage||0)))}</div>`; } }catch(e){}
+    if(!$("#stor")) return;
+    $("#stor").innerHTML = `<div>${st.n} photo(s) · ${fmtSize(st.bytes)}${st.n?` · ${fmtSize(Math.round(st.bytes/st.n))} en moyenne`:""}</div>${quota}`;
+    // estimation du .zip : photos pleine taille (sans miniatures)
+    let full=0; try{ for(const k of await PDB.keys()){ const r=await PDB.get(k); if(r) full+=sizeOf(r.full); } }catch(e){}
+    if($("#bkpSize")) $("#bkpSize").textContent = `(≈ ${fmtSize(full+20000)})`;
+    if(st.legacy && $("#optBox")){
+      $("#optBox").innerHTML = `<p style="margin:12px 0 10px;font-size:14px">${st.legacy} photo(s) ajoutée(s) avec l'ancienne version peuvent être allégées.</p><button class="btn ghost" id="optBtn">Optimiser les photos</button>`;
+      $("#optBtn").onclick = async ()=>{
+        const b=$("#optBtn"); b.disabled=true;
+        const gain = await optimizeOld(n=>{ b.textContent=`Optimisation… ${n} / ${st.legacy}`; });
+        toast(gain>0 ? `${fmtSize(gain)} libérés` : "Photos déjà optimisées");
+        renderExport();
+      };
+    }
+  })();
+
   $("#bkp").onclick = async ()=>{
-    $("#bkp").textContent = "Préparation…";
-    const content = await backupJSON();
-    $("#bkp").textContent = "Sauvegarder les données";
-    const ok = await shareOrDownload(content, `livre-de-bord-${stamp()}.json`, "application/json");
-    if(ok){ try{ lsSet("ldb_lastBackup", new Date().toISOString()); }catch(e){} toast("Sauvegarde créée"); renderExport(); }
+    const b=$("#bkp"), lab=b.innerHTML; b.disabled=true;
+    try{
+      const zip = await backupZip((i,n)=>{ b.textContent=`Préparation… ${i} / ${n}`; });
+      b.innerHTML=lab; b.disabled=false;
+      const ok = await shareOrDownload(zip, `livre-de-bord-${stamp()}.zip`, "application/zip");
+      if(ok){ try{ lsSet("ldb_lastBackup", new Date().toISOString()); }catch(e){} toast("Sauvegarde créée"); renderExport(); }
+    }catch(e){ b.innerHTML=lab; b.disabled=false; toast("Sauvegarde impossible : mémoire insuffisante"); }
+  };
+  $("#bkpLight").onclick = async ()=>{
+    const ok = await shareOrDownload(backupLight(), `livre-de-bord-${stamp()}-sans-photos.json`, "application/json");
+    if(ok) toast("Sauvegarde légère créée");
   };
   $("#csvBtn").onclick = ()=> shareOrDownload("﻿"+csv, `livre-de-bord-${stamp()}.csv`, "text/csv");
   $("#impBtn").onclick = ()=> $("#imp").click();
   $("#imp").onchange = async ev=>{
     const file = ev.target.files && ev.target.files[0]; ev.target.value="";
     if(!file) return;
-    let data;
-    try{ data = JSON.parse(await file.text()); }catch(e){ toast("Fichier illisible"); return; }
+    let bk;
+    try{ bk = await readBackup(file); }catch(e){ toast(e && e.message==="deflate" ? "Ce zip a été recompressé : utilisez le fichier d'origine" : "Fichier illisible"); return; }
+    const data = bk.data;
     if(!data || data.app!=="livre-de-bord-voile" || !Array.isArray(data.entries)){ toast("Ce n'est pas une sauvegarde du livre de bord"); return; }
-    const pics = (data.photos && typeof data.photos==="object") ? data.photos : {};
-    const okPic = id => typeof id==="string" && /^p_[\w-]+$/.test(id) && pics[id] && typeof pics[id].full==="string" && pics[id].full.startsWith("data:image/") && typeof pics[id].thumb==="string" && pics[id].thumb.startsWith("data:image/");
-    const inc = data.entries.filter(validEntry).map(e=>Object.assign({}, e, {photos: Array.isArray(e.photos) ? e.photos.filter(okPic) : []}));
+    let local = new Set(); try{ local = new Set(await PDB.keys()); }catch(e){}
+    const okId = id => typeof id==="string" && /^p_[\w-]+$/.test(id);
+    const inc = data.entries.filter(validEntry).map(e=>Object.assign({}, e, {photos: Array.isArray(e.photos) ? e.photos.filter(id=>okId(id) && (bk.hasPhoto(id) || local.has(id))) : []}));
+    const toImport = [...new Set(inc.flatMap(e=>e.photos))].filter(id=>bk.hasPhoto(id));
     const ids = new Set(entries.map(e=>e.id));
     const nouv = inc.filter(e=>!ids.has(e.id)).length;
-    dialog(`<p><b>Restaurer ${inc.length} sortie(s) ?</b><br><span style="color:var(--muted);font-size:14px">Sauvegarde du ${esc(fmtDate(String(data.exported||"").slice(0,10),{day:"numeric",month:"long",year:"numeric"}))}. Vous avez actuellement ${entries.length} sortie(s).</span></p>
+    dialog(`<p><b>Restaurer ${inc.length} sortie(s) et ${toImport.length} photo(s) ?</b><br><span style="color:var(--muted);font-size:14px">Sauvegarde du ${esc(fmtDate(String(data.exported||"").slice(0,10),{day:"numeric",month:"long",year:"numeric"}))}. Vous avez actuellement ${entries.length} sortie(s).</span></p>
       <button class="btn pri" id="dMerge">Fusionner (${nouv} nouvelle(s))</button><div style="height:8px"></div>
       <button class="btn danger" id="dReplace">Tout remplacer</button><div style="height:8px"></div>
       <button class="btn ghost" id="dNo">Annuler</button>`);
     $("#dNo").onclick = closeDialog;
     const apply = async (replace)=>{
       const prevE = entries, prevP = profile;
-      $("#dlgbox").innerHTML = `<p><b>Restauration en cours…</b></p>`;
-      let picFail = 0;
-      for(const id of new Set(inc.flatMap(e=>e.photos))){
-        try{ await PDB.put(id, {full: pics[id].full, thumb: pics[id].thumb}); }catch(err){ picFail++; }
+      $("#dlgbox").innerHTML = `<p><b>Restauration en cours…</b> <span id="rst"></span></p>`;
+      let picFail = 0, i = 0;
+      for(const id of toImport){
+        try{
+          const src = bk.getPhoto(id);
+          let rec;
+          if(bk.fromZip){ const im = await loadImg(src); rec = {full: src, thumb: await encode(drawTo(im, THUMB_MAX), THUMB_Q), v:3}; }
+          else rec = await makeRecord(src);   // anciennes sauvegardes : recompressées au passage
+          await storeRecord(id, rec);
+        }catch(err){ picFail++; }
+        const r=$("#rst"); if(r) r.textContent = `${++i} / ${toImport.length}`;
       }
       const inProf = (data.profile && typeof data.profile==="object" && !Array.isArray(data.profile)) ? data.profile : {};
       try{
