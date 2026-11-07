@@ -81,6 +81,30 @@ textarea{min-height:80px;resize:vertical}
 .detail dd{margin:0;font-weight:500}
 .hint{font-size:12px;color:var(--muted);margin-top:4px}
 .bf{font-size:12px;color:var(--muted);margin-top:4px;min-height:16px}
+.photos{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
+.photos:empty{display:none}
+.photos .ph{position:relative;aspect-ratio:1;border-radius:10px;overflow:hidden;background:var(--line)}
+.photos img{width:100%;height:100%;object-fit:cover;display:block;cursor:pointer}
+.phx{position:absolute;top:4px;right:4px;width:26px;height:26px;border-radius:50%;border:0;background:rgba(11,37,69,.75);color:#fff;font-size:17px;line-height:1;cursor:pointer}
+.season{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:4px}
+.season button{border:0;border-radius:6px;height:38px;font:inherit;font-size:13px;font-weight:700;cursor:pointer;padding:0}
+.season button.cur{outline:2px solid var(--amber);outline-offset:1px}
+.season button.sel{outline:2px solid var(--sea);outline-offset:1px}
+.mlab{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:4px;margin-top:4px;text-align:center;font-size:11px;color:var(--muted)}
+.legend{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);margin-top:10px}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px}
+.mdet{margin-top:10px;background:var(--foam);border-radius:10px;padding:10px 12px;font-size:14px}
+.mdet a{display:block;color:var(--navy2);text-decoration:none;padding:4px 0;cursor:pointer}
+.due{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--sand);border-radius:12px;padding:12px;margin-bottom:12px}
+.due b{font-size:16px;color:var(--navy)}
+.pill{font-size:12px;font-weight:700;padding:4px 9px;border-radius:999px;white-space:nowrap}
+.pill.ok{background:#e3f3ea;color:var(--green)}
+.pill.soon{background:#fdf1dc;color:#8a5a00}
+.pill.late{background:#fbe5e2;color:var(--red)}
+.hist{margin-top:12px}
+.hist div.h{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+.hist .x{border:0;background:none;color:var(--muted);font-size:18px;cursor:pointer;padding:0 4px}
+.alert{background:#fdf1dc;color:#8a5a00;border-radius:12px;padding:10px 12px;font-size:14px;margin-bottom:12px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -141,10 +165,84 @@ async function saveEntry(e){
   lsSet("ldb_entries", entries);
 }
 async function deleteEntry(id){
+  const e = entries.find(x=>x.id===id);
   entries = entries.filter(x=>x.id!==id); lsSet("ldb_entries", entries);
+  if(e && e.photos) for(const p of e.photos){ try{ await PDB.del(p); }catch(err){} }
 }
 async function saveProfile(p){
-  profile = p; lsSet("ldb_profile", p);
+  const prev = profile; profile = p;
+  try{ lsSet("ldb_profile", p); }catch(e){ profile = prev; throw e; }
+}
+
+/* ---------- Photos (IndexedDB) ---------- */
+const PDB = (()=>{
+  let dbp = null;
+  function open(){
+    if(dbp) return dbp;
+    dbp = new Promise((res,rej)=>{
+      try{
+        const r = indexedDB.open("ldb_photos", 1);
+        r.onupgradeneeded = ()=> r.result.createObjectStore("photos");
+        r.onsuccess = ()=> res(r.result);
+        r.onerror = ()=> { dbp=null; rej(r.error); };
+      }catch(e){ dbp=null; rej(e); }
+    });
+    return dbp;
+  }
+  async function run(mode, fn){
+    const db = await open();
+    return new Promise((res,rej)=>{
+      const t = db.transaction("photos", mode);
+      const req = fn(t.objectStore("photos"));
+      t.oncomplete = ()=> res(req ? req.result : undefined);
+      t.onerror = ()=> rej(t.error); t.onabort = ()=> rej(t.error);
+    });
+  }
+  return {
+    put: (id, v)=> run("readwrite", s=>s.put(v, id)),
+    get: (id)=> run("readonly", s=>s.get(id)),
+    del: (id)=> run("readwrite", s=>s.delete(id)),
+    keys: ()=> run("readonly", s=>s.getAllKeys())
+  };
+})();
+async function gcPhotos(){
+  try{
+    const used = new Set(entries.flatMap(e=>e.photos||[]));
+    for(const k of await PDB.keys()) if(!used.has(k)) await PDB.del(k);
+  }catch(e){}
+}
+function loadImg(file){
+  return new Promise((res,rej)=>{
+    const url = URL.createObjectURL(file); const im = new Image();
+    im.onload = ()=>{ URL.revokeObjectURL(url); res(im); };
+    im.onerror = ()=>{ URL.revokeObjectURL(url); rej(new Error("image")); };
+    im.src = url;
+  });
+}
+function toJpeg(im, max, q){
+  const r = Math.min(1, max/Math.max(im.naturalWidth, im.naturalHeight));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(im.naturalWidth*r)); c.height = Math.max(1, Math.round(im.naturalHeight*r));
+  c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", q);
+}
+async function addPhoto(file){
+  const im = await loadImg(file);
+  const id = "p_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+  await PDB.put(id, {full: toJpeg(im, 1600, 0.78), thumb: toJpeg(im, 320, 0.7)});
+  return id;
+}
+async function fillThumbs(root){
+  for(const img of root.querySelectorAll("img[data-pid]")){
+    try{ const p = await PDB.get(img.dataset.pid); if(p) img.src = p.thumb; }catch(e){}
+  }
+}
+async function showPhoto(id){
+  try{
+    const p = await PDB.get(id); if(!p) return;
+    dialog(`<img src="${p.full}" alt="" style="width:100%;max-height:70vh;object-fit:contain;border-radius:10px;display:block;margin-bottom:12px"><button class="btn ghost" id="dNo">Fermer</button>`);
+    $("#dNo").onclick = closeDialog;
+  }catch(e){ toast("Photo illisible"); }
 }
 
 /* ---------- Fichiers (sauvegarde / restauration) ---------- */
@@ -164,8 +262,12 @@ async function shareOrDownload(content, name, mime){
   setTimeout(()=>URL.revokeObjectURL(url), 4000);
   return true;
 }
-function backupJSON(){
-  return JSON.stringify({app:"livre-de-bord-voile", version:1, exported:new Date().toISOString(), profile, entries}, null, 2);
+async function backupJSON(){
+  const photos = {};
+  for(const id of entries.flatMap(e=>e.photos||[])){
+    try{ const p = await PDB.get(id); if(p) photos[id] = p; }catch(e){}
+  }
+  return JSON.stringify({app:"livre-de-bord-voile", version:2, exported:new Date().toISOString(), profile, entries, photos});
 }
 function validEntry(e){ return e && typeof e==="object" && typeof e.id==="string" && /^s_[\w-]+$/.test(e.id) && typeof e.date==="string"; }
 
@@ -205,7 +307,10 @@ function render(){
 function renderJournal(){
   const list = entries.slice().sort((a,b)=>(b.date+b.depart).localeCompare(a.date+a.depart))
     .filter(e => !filter || [e.destination,e.portDepart,e.equipage,e.notes].join(" ").toLowerCase().includes(filter.toLowerCase()));
-  let html = `<input class="search" type="search" placeholder="Rechercher une destination, un équipier…" value="${esc(filter)}" id="q">`;
+  let html = "";
+  CHECKS.forEach(c=>{ const n=daysUntil(profile[c.next]); if(n!=null && n<=60)
+    html += `<div class="alert" data-goboat>${c.icon} ${esc(c.label)} : ${n<0?`en retard de ${-n} jour${-n>1?"s":""}`:n===0?"aujourd'hui":`dans ${n} jour${n>1?"s":""}`} (${esc(fmtDate(profile[c.next],{day:"numeric",month:"long",year:"numeric"}))})</div>`; });
+  html += `<input class="search" type="search" placeholder="Rechercher une destination, un équipier…" value="${esc(filter)}" id="q">`;
   if(!entries.length){
     html += `<div class="empty"><svg viewBox="0 0 64 64" fill="none" stroke="#13315c" stroke-width="2"><path d="M32 6v40M32 6l18 32H32M32 14L18 38h14M8 48h48l-6 8H14z"/></svg>
       <p><b>Aucune sortie enregistrée</b><br>Touchez <b>+</b> pour noter votre première navigation.</p></div>`;
@@ -217,7 +322,7 @@ function renderJournal(){
       <div class="d"><b>${d.getDate()}</b><small>${d.toLocaleDateString("fr-FR",{month:"short"})}</small><small>${d.getFullYear()}</small></div>
       <div class="t">
         <h3>${esc(e.portDepart||"?")} → ${esc(e.destination||"?")}</h3>
-        <div class="meta"><span>🕒 ${esc(e.depart||"–")}–${esc(e.retour||"–")}</span><span>⛵ ${fmtMin(dur(e))}</span>${e.distance?`<span>📍 ${esc(e.distance)} NM</span>`:""}</div>
+        <div class="meta"><span>🕒 ${esc(e.depart||"–")}–${esc(e.retour||"–")}</span><span>⛵ ${fmtMin(dur(e))}</span>${(e.photos||[]).length?`<span>📷 ${e.photos.length}</span>`:""}</div>
         <div class="tags">
           ${e.ciel?`<span class="tag">${esc(e.ciel)}</span>`:""}
           ${e.ventDir||e.beaufort!==undefined&&e.beaufort!==""?`<span class="tag">💨 ${esc(e.ventDir||"")} ${e.beaufort!==""&&e.beaufort!=null?"F"+esc(e.beaufort):""}</span>`:""}
@@ -232,6 +337,7 @@ function renderJournal(){
   app.innerHTML = html;
   const q=$("#q"); q.addEventListener("input", ()=>{ filter=q.value; const pos=q.selectionStart; renderJournal(); const n=$("#q"); n.focus(); n.setSelectionRange(pos,pos); });
   app.querySelectorAll(".trip").forEach(c=>c.addEventListener("click", ()=>{ editing=c.dataset.id; go("detail"); }));
+  app.querySelectorAll("[data-goboat]").forEach(a=>a.onclick=()=>go("boat"));
 }
 
 /* ---------- Détail ---------- */
@@ -248,16 +354,19 @@ function renderDetail(){
     ${row("Type",e.type)}${row("Départ",e.depart)}${row("Retour",e.retour)}${row("Port d'arrivée",e.portArrivee)}${row("Skipper",e.skipper)}${row("Équipage",e.equipage)}${row("Personnes à bord",e.nbPers)}
   </dl></div>
   <div class="card detail"><div class="sec">Météo</div><dl>
-    ${row("Ciel",e.ciel)}${row("Vent",[e.ventDir, e.beaufort!==""&&e.beaufort!=null?"Force "+e.beaufort:"", e.ventNd?e.ventNd+" nd":""].filter(Boolean).join(" · "))}${row("Rafales",e.rafales?e.rafales+" nd":"")}${row("Temp. air",e.tempAir?e.tempAir+" °C":"")}${row("Temp. eau",e.tempEau?e.tempEau+" °C":"")}${row("État de la mer",e.mer)}${row("Pression",e.pression?e.pression+" hPa":"")}${row("Visibilité",e.visibilite)}
+    ${row("Ciel",e.ciel)}${row("Vent",[e.ventDir, e.beaufort!==""&&e.beaufort!=null?"Force "+e.beaufort:"", e.ventNd?e.ventNd+" nd":""].filter(Boolean).join(" · "))}${row("Rafales",e.rafales?e.rafales+" nd":"")}${row("Temp. air",e.tempAir?e.tempAir+" °C":"")}${row("Temp. eau",e.tempEau?e.tempEau+" °C":"")}${row("État de la mer",e.mer)}${row("Visibilité",e.visibilite)}
   </dl></div>
   <div class="card detail"><div class="sec">Moteur</div><dl>
     ${row("Sortie du port",e.motSortie?e.motSortie+" min":"")}${row("Entrée au port",e.motEntree?e.motEntree+" min":"")}${row("Autre (pétole…)",e.motAutre?e.motAutre+" min":"")}${row("Compteur moteur",e.compteur?e.compteur+" h":"")}${row("Carburant ajouté",e.carburant?e.carburant+" L":"")}
   </dl></div>
   <div class="card detail"><div class="sec">Navigation</div><dl>
-    ${row("Distance",e.distance?e.distance+" NM":"")}${row("Vitesse max",e.vmax?e.vmax+" nd":"")}${row("Voilure",(e.voiles||[]).join(", "))}
+    ${row("Voilure",(e.voiles||[]).join(", "))}
   </dl>${e.notes?`<p style="margin:12px 0 0;white-space:pre-wrap">${esc(e.notes)}</p>`:""}</div>
+  ${(e.photos||[]).length ? `<div class="card"><div class="sec">📷 Photos (${e.photos.length})</div><div class="photos" id="ph">${e.photos.map(id=>`<div class="ph"><img data-pid="${esc(id)}" alt=""></div>`).join("")}</div></div>` : ""}
   <div class="row"><button class="btn ghost" id="bEdit">Modifier</button><button class="btn danger" id="bDel">Supprimer</button></div>
   <button class="btn ghost" id="bBack">← Retour au journal</button>`;
+  app.querySelectorAll(".card.detail").forEach(c=>{ if(!c.querySelector("dd") && !c.querySelector("p")) c.remove(); });
+  if($("#ph")){ $("#ph").querySelectorAll("img[data-pid]").forEach(i=>i.onclick=()=>showPhoto(i.dataset.pid)); fillThumbs($("#ph")); }
   $("#bBack").onclick=()=>go("journal");
   $("#bEdit").onclick=()=>go("new");
   $("#bDel").onclick=()=>{
@@ -288,7 +397,7 @@ function renderForm(){
 
   <div class="card"><div class="sec">🌤 Météo</div>
     <div class="f"><label>Ciel</label><div class="chips">${chips("ciel",SKY,e.ciel)}</div></div>
-    <div class="row3">${inp("tempAir","Air °C","number","inputmode=decimal step=0.5")}${inp("tempEau","Eau °C","number","inputmode=decimal step=0.5")}${inp("pression","hPa","number","inputmode=numeric")}</div>
+    <div class="row">${inp("tempAir","Température air (°C)","number","inputmode=decimal step=0.5")}${inp("tempEau","Température eau (°C)","number","inputmode=decimal step=0.5")}</div>
     <div class="f"><label>Visibilité</label><select name="visibilite" id="visibilite">${["","Bonne (> 5 NM)","Moyenne (2–5 NM)","Médiocre (1–2 NM)","Mauvaise (< 1 NM)"].map(v=>`<option ${e.visibilite===v?"selected":""} value="${v}">${v||"—"}</option>`).join("")}</select></div>
   </div>
 
@@ -309,9 +418,14 @@ function renderForm(){
   </div>
 
   <div class="card"><div class="sec">⛵ Navigation</div>
-    <div class="row">${inp("distance","Distance (NM)","number","inputmode=decimal step=0.1")}${inp("vmax","Vitesse max (nd)","number","inputmode=decimal step=0.1")}</div>
     <div class="f"><label>Voilure utilisée</label><div class="chips">${SAILS.map(s=>`<button type="button" class="chip ${e.voiles.includes(s)?"on":""}" data-multi="voiles" data-v="${s}">${s}</button>`).join("")}</div></div>
     <div class="f"><label for="notes">Notes, incidents, observations</label><textarea id="notes" name="notes" placeholder="Dauphins au large, ris pris à 14h, avarie…">${esc(e.notes||"")}</textarea></div>
+  </div>
+
+  <div class="card"><div class="sec">📷 Photos</div>
+    <div class="photos" id="ph"></div>
+    <input type="file" id="phIn" accept="image/*" multiple style="display:none">
+    <button class="btn ghost" type="button" id="phBtn">Ajouter des photos</button>
   </div>
 
   <button class="btn pri" type="submit">${editing?"Enregistrer les modifications":"Enregistrer la sortie"}</button>
@@ -339,17 +453,45 @@ function renderForm(){
     $("#calc").innerHTML = `<div><b>${fmtMin(d)}</b><small>Durée totale</small></div><div><b>${fmtMin(d!=null?Math.max(d-m,0):null)}</b><small>À la voile</small></div><div><b>${fmtMin(m)}</b><small>Moteur</small></div>`;
   };
   ["depart","retour","motSortie","motEntree","motAutre"].forEach(n=>f[n].addEventListener("input",upd)); upd();
-  $("#cancel").onclick=()=> go(editing?"detail":"journal");
+
+  // Photos
+  const original = (e.photos||[]).slice();
+  state.photos = original.slice();
+  const added = [];
+  const drawPhotos = ()=>{
+    $("#ph").innerHTML = state.photos.map(id=>`<div class="ph"><img data-pid="${esc(id)}" alt=""><button type="button" class="phx" data-del="${esc(id)}" aria-label="Retirer la photo">×</button></div>`).join("");
+    $("#ph").querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>{ state.photos = state.photos.filter(x=>x!==b.dataset.del); drawPhotos(); });
+    $("#ph").querySelectorAll("img[data-pid]").forEach(i=>i.onclick=()=>showPhoto(i.dataset.pid));
+    fillThumbs($("#ph"));
+  };
+  drawPhotos();
+  $("#phBtn").onclick = ()=> $("#phIn").click();
+  $("#phIn").onchange = async ev=>{
+    const files = [...(ev.target.files||[])]; ev.target.value="";
+    if(!files.length) return;
+    $("#phBtn").textContent = "Ajout en cours…";
+    let fail = 0;
+    for(const file of files){
+      try{ const id = await addPhoto(file); added.push(id); state.photos.push(id); }catch(err){ fail++; }
+    }
+    $("#phBtn").textContent = "Ajouter des photos";
+    if(fail) toast(fail===1 ? "Une photo n'a pas pu être ajoutée" : fail+" photos n'ont pas pu être ajoutées");
+    drawPhotos();
+  };
+
+  $("#cancel").onclick=async ()=>{ for(const id of added){ try{ await PDB.del(id); }catch(err){} } go(editing?"detail":"journal"); };
 
   f.addEventListener("submit", async ev=>{
     ev.preventDefault();
-    const out = {id: editing || ("s_" + Date.now().toString(36) + Math.random().toString(36).slice(2,6))};
-    ["date","type","depart","retour","portDepart","destination","portArrivee","skipper","nbPers","equipage","tempAir","tempEau","pression","visibilite","ventNd","rafales","motSortie","motEntree","motAutre","compteur","carburant","distance","vmax","notes"]
+    const prev = editing ? entries.find(x=>x.id===editing) : null;
+    const out = Object.assign({}, prev||{}, {id: editing || ("s_" + Date.now().toString(36) + Math.random().toString(36).slice(2,6))});
+    ["date","type","depart","retour","portDepart","destination","portArrivee","skipper","nbPers","equipage","tempAir","tempEau","visibilite","ventNd","rafales","motSortie","motEntree","motAutre","compteur","carburant","notes"]
       .forEach(k=>{ out[k] = f[k].value.trim(); });
-    Object.assign(out, {ciel:state.ciel, mer:state.mer, ventDir:state.ventDir, voiles:state.voiles, beaufort:state.beaufort});
+    Object.assign(out, {ciel:state.ciel, mer:state.mer, ventDir:state.ventDir, voiles:state.voiles, beaufort:state.beaufort, photos:state.photos.slice()});
     out.updated = new Date().toISOString();
     try{
       await saveEntry(out);
+      for(const id of original.concat(added)) if(!out.photos.includes(id)){ try{ await PDB.del(id); }catch(err){} }
       if(out.compteur && (!profile.compteur || +out.compteur > +profile.compteur)){ try{ await saveProfile(Object.assign({}, profile, {compteur: out.compteur})); }catch(e){} }
       toast(editing ? "Sortie mise à jour" : "Sortie enregistrée ⛵");
       editing = out.id; go("detail");
@@ -364,29 +506,61 @@ function renderStats(){
   const yrs = [...new Set(entries.map(e=>(e.date||"").slice(0,4)))].filter(Boolean).sort().reverse();
   const sel = renderStats.year || "all";
   const list = sel==="all" ? entries : entries.filter(e=>(e.date||"").startsWith(sel));
-  let tot=0, mot=0, nm=0, vmax=0; const dests={}, wind={};
-  list.forEach(e=>{ const d=dur(e)||0; tot+=d; mot+=motor(e); nm+=+e.distance||0; vmax=Math.max(vmax,+e.vmax||0);
+  let tot=0, mot=0; const dests={}, wind={};
+  list.forEach(e=>{ const d=dur(e)||0; tot+=d; mot+=motor(e);
     if(e.destination) dests[e.destination]=(dests[e.destination]||0)+1;
     if(e.beaufort!==""&&e.beaufort!=null) wind[e.beaufort]=(wind[e.beaufort]||0)+1; });
   const voile=Math.max(tot-mot,0), pv = tot? Math.round(voile/tot*100):0;
   const top = Object.entries(dests).sort((a,b)=>b[1]-a[1]).slice(0,5);
   const wmax = Math.max(1,...Object.values(wind));
+
+  // Mois en cours
+  const now = new Date();
+  const curY = String(now.getFullYear()), curM = now.getMonth();
+  const curKey = curY + "-" + String(curM+1).padStart(2,"0");
+  const thisMonth = entries.filter(e=>(e.date||"").startsWith(curKey)).length;
+  const MOIS = ["janvier","février","mars","avril","mai","juin","juillet","août","septembre","octobre","novembre","décembre"];
+
+  // Saison sur une ligne
+  const seasonY = sel==="all" ? curY : sel;
+  const byMonth = Array.from({length:12}, (_,i)=> entries.filter(e=>(e.date||"").startsWith(seasonY+"-"+String(i+1).padStart(2,"0")))
+    .sort((a,b)=>(a.date+a.depart).localeCompare(b.date+b.depart)));
+  if(renderStats.month==null || renderStats.monthYear!==seasonY){
+    renderStats.monthYear = seasonY;
+    if(seasonY===curY) renderStats.month = curM;
+    else { let m=11; while(m>0 && !byMonth[m].length) m--; renderStats.month = m; }
+  }
+  const selM = renderStats.month;
+  const shade = n => !n ? ["var(--line)","var(--muted)"] : n===1 ? ["#cfe3f3","#0b2545"] : n<=3 ? ["#8dbbe0","#0b2545"] : n<=5 ? ["#3d87c4","#fff"] : ["#0b2545","#fff"];
+  const mlist = byMonth[selM];
+
   app.innerHTML = `
   <div class="chips" style="margin-bottom:12px">${["all",...yrs].map(y=>`<button class="chip ${sel===y?"on":""}" data-y="${y}">${y==="all"?"Toutes":y}</button>`).join("")}</div>
   <div class="stats">
-    <div class="stat"><b>${list.length}</b><small>Sorties</small></div>
-    <div class="stat"><b>${nm.toFixed(1)}</b><small>Milles parcourus</small></div>
+    <div class="stat"><b>${list.length}</b><small>Sorties${sel==="all"?"":" en "+sel}</small></div>
+    <div class="stat"><b>${thisMonth}</b><small>Sortie${thisMonth>1?"s":""} en ${MOIS[curM]}</small></div>
     <div class="stat"><b>${fmtMin(voile)}</b><small>À la voile</small></div>
     <div class="stat"><b>${fmtMin(mot)}</b><small>Au moteur</small></div>
   </div>
+  <div class="card"><div class="sec">📅 La saison ${seasonY}</div>
+    <div class="season">${byMonth.map((l,i)=>{ const [bg,fg]=shade(l.length); const cls=[seasonY===curY&&i===curM?"cur":"", i===selM&&!(seasonY===curY&&i===curM)?"sel":""].join(" ");
+      return `<button class="${cls}" data-m="${i}" style="background:${bg};color:${fg}" aria-label="${MOIS[i]} : ${l.length} sortie(s)">${l.length||""}</button>`; }).join("")}</div>
+    <div class="mlab">${"JFMAMJJASOND".split("").map(c=>`<span>${c}</span>`).join("")}</div>
+    <div class="legend"><span>0</span><i style="background:var(--line)"></i><i style="background:#cfe3f3"></i><i style="background:#8dbbe0"></i><i style="background:#3d87c4"></i><i style="background:#0b2545"></i><span>6+ sorties</span></div>
+    <div class="mdet"><b>${MOIS[selM].charAt(0).toUpperCase()+MOIS[selM].slice(1)} ${seasonY} · ${mlist.length} sortie${mlist.length>1?"s":""}</b>
+      ${mlist.length ? mlist.map(e=>`<a data-open="${esc(e.id)}">${esc(fmtDate(e.date,{day:"numeric",month:"short"}))} · ${esc(e.portDepart||"?")} → ${esc(e.destination||"?")}${dur(e)!=null?" · "+fmtMin(dur(e)):""} ›</a>`).join("") : `<div class="meta" style="margin-top:4px">Aucune sortie</div>`}
+    </div>
+  </div>
   <div class="card"><div class="sec">Voile vs moteur</div>
     <div class="bar"><i style="width:${pv}%;background:var(--sea)"></i><i style="width:${100-pv}%;background:var(--amber)"></i></div>
-    <div class="meta"><span>⛵ Voile ${pv}%</span><span>⚙️ Moteur ${tot?100-pv:0}%</span>${vmax?`<span>🚀 Vmax ${vmax} nd</span>`:""}</div></div>
+    <div class="meta"><span>⛵ Voile ${pv}%</span><span>⚙️ Moteur ${tot?100-pv:0}%</span></div></div>
   <div class="card"><div class="sec">Destinations favorites</div>
     ${top.length? top.map(([d,n])=>`<div class="meta" style="justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)"><span style="color:var(--ink)">${esc(d)}</span><span>${n}×</span></div>`).join("") : `<div class="meta">Pas encore de données</div>`}</div>
   <div class="card"><div class="sec">Forces de vent rencontrées</div>
     ${Object.keys(wind).length ? `<div style="display:flex;align-items:flex-end;gap:4px;height:90px">${Array.from({length:9},(_,i)=>`<div style="flex:1;text-align:center;font-size:11px;color:var(--muted)"><div style="height:${(wind[i]||0)/wmax*70}px;background:var(--navy2);border-radius:4px 4px 0 0;margin-bottom:3px"></div>F${i}</div>`).join("")}</div>` : `<div class="meta">Pas encore de données</div>`}</div>`;
-  app.querySelectorAll("[data-y]").forEach(b=>b.onclick=()=>{ renderStats.year=b.dataset.y; renderStats(); });
+  app.querySelectorAll("[data-y]").forEach(b=>b.onclick=()=>{ renderStats.year=b.dataset.y; renderStats.month=null; renderStats(); });
+  app.querySelectorAll("[data-m]").forEach(b=>b.onclick=()=>{ renderStats.month=+b.dataset.m; renderStats(); });
+  app.querySelectorAll("[data-open]").forEach(a=>a.onclick=()=>{ editing=a.dataset.open; go("detail"); });
 }
 
 /* ---------- Bateau ---------- */
@@ -398,25 +572,82 @@ function renderBoat(){
     <div class="row">${inp("type","Modèle / type")}${inp("immat","Immatriculation")}</div>
     <div class="row">${inp("longueur","Longueur (m)","number")}${inp("moteur","Moteur (marque, cv)")}</div>
     <div class="row">${inp("port","Port d'attache")}${inp("skipper","Skipper habituel")}</div>
-    <div class="row">${inp("compteur","Compteur moteur (h)","number")}${inp("vidange","Prochaine vidange à (h)","number")}</div>
-    <div id="vid"></div>
-  </div><button class="btn pri" type="submit">Enregistrer</button></form>`;
-  if(p.compteur && p.vidange){
-    const rest = (+p.vidange) - (+p.compteur);
-    $("#vid").innerHTML = `<div class="calc" style="grid-template-columns:1fr"><div><b style="color:${rest<10?"var(--red)":"var(--navy)"}">${rest.toFixed(1)} h</b><small>avant la prochaine vidange</small></div></div>`;
-  }
+    <div class="f">${inp("compteur","Compteur moteur (h)","number")}</div>
+  </div><button class="btn pri" type="submit">Enregistrer</button></form>
+  <div style="height:14px"></div>
+  ${CHECKS.map(c=>checkCard(c)).join("")}`;
   $("#bf").addEventListener("submit", async ev=>{
-    ev.preventDefault(); const f=ev.target; const o={};
-    ["nom","type","immat","longueur","moteur","port","skipper","compteur","vidange"].forEach(k=>o[k]=f[k].value.trim());
+    ev.preventDefault(); const f=ev.target; const o=Object.assign({}, profile);
+    delete o.vidange;
+    ["nom","type","immat","longueur","moteur","port","skipper","compteur"].forEach(k=>o[k]=f[k].value.trim());
     try{ await saveProfile(o); toast("Bateau enregistré"); render(); }catch(e){ toast("Enregistrement impossible"); }
   });
+  CHECKS.forEach(c=>{
+    $("#do_"+c.key).onclick = ()=> recordCheck(c);
+    $("#next_"+c.key).onchange = async ev=>{
+      try{ await saveProfile(Object.assign({}, profile, {[c.next]: ev.target.value})); toast("Échéance enregistrée"); renderBoat(); }catch(e){ toast("Enregistrement impossible"); }
+    };
+    app.querySelectorAll(`[data-hdel="${c.key}"]`).forEach(b=>b.onclick=()=>{
+      const i=+b.dataset.i; const h=(profile[c.hist]||[])[i]; if(!h) return;
+      dialog(`<p><b>Supprimer cette ligne de l'historique ?</b><br><span style="color:var(--muted)">${esc(c.label)} du ${esc(fmtDate(h.date,{day:"numeric",month:"long",year:"numeric"}))}</span></p>
+        <div class="row" style="margin:0"><button class="btn ghost" id="dNo">Annuler</button><button class="btn danger" id="dYes">Supprimer</button></div>`);
+      $("#dNo").onclick=closeDialog;
+      $("#dYes").onclick=async()=>{ const hist=(profile[c.hist]||[]).slice(); hist.splice(i,1);
+        try{ await saveProfile(Object.assign({}, profile, {[c.hist]: hist})); closeDialog(); renderBoat(); }catch(e){ closeDialog(); toast("Suppression impossible"); } };
+    });
+  });
+}
+
+/* ---------- Échéances : expertise et contrôle du gaz ---------- */
+const CHECKS = [
+  {key:"exp", label:"Expertise", icon:"🛟", title:"Expertise du bateau", next:"nextExpertise", hist:"histExpertise", ph:"Organisme, expert, résultat, remarques…"},
+  {key:"gaz", label:"Contrôle du gaz", icon:"🔥", title:"Contrôle de l'installation gaz", next:"nextGaz", hist:"histGaz", ph:"Installateur, flexibles changés, résultat…"}
+];
+function daysUntil(d){ if(!d) return null; return Math.round((new Date(d+"T12:00") - new Date(today()+"T12:00"))/86400000); }
+function dueInfo(d){
+  const n = daysUntil(d);
+  if(n==null) return null;
+  if(n<0) return {cls:"late", txt:`En retard de ${-n} j`};
+  if(n===0) return {cls:"late", txt:"Aujourd'hui"};
+  if(n<=60) return {cls:"soon", txt:`Dans ${n} j`};
+  const mo = Math.round(n/30.4);
+  return {cls:"ok", txt: mo<24 ? `Dans ${mo} mois` : `Dans ${Math.round(n/365)} ans`};
+}
+function checkCard(c){
+  const next = profile[c.next]||"", hist = (profile[c.hist]||[]), info = dueInfo(next);
+  return `<div class="card"><div class="sec">${c.icon} ${esc(c.title)}</div>
+    <div class="due"><div><small style="color:var(--muted);font-size:12px">Prochain${c.key==="exp"?"e expertise":" contrôle"}</small><br><b>${next?esc(fmtDate(next,{day:"numeric",month:"long",year:"numeric"})):"Non planifié"}</b></div>${info?`<span class="pill ${info.cls}">${info.txt}</span>`:""}</div>
+    <div class="f"><label for="next_${c.key}">Modifier la date de la prochaine échéance</label><input type="date" id="next_${c.key}" value="${esc(next)}"></div>
+    <button class="btn ghost" id="do_${c.key}">✓ Noter ${c.key==="exp"?"une expertise effectuée":"un contrôle effectué"}</button>
+    <div class="hist"><div style="font-size:13px;color:var(--muted);font-weight:700;margin-bottom:4px">Historique</div>
+      ${hist.length ? hist.map((h,i)=>`<div class="h"><div><b>${esc(fmtDate(h.date,{day:"numeric",month:"long",year:"numeric"}))}</b>${h.note?`<br><span style="color:var(--muted)">${esc(h.note)}</span>`:""}</div><button class="x" data-hdel="${c.key}" data-i="${i}" aria-label="Supprimer">×</button></div>`).join("")
+        : `<div class="meta">${c.key==="exp"?"Aucune expertise enregistrée":"Aucun contrôle enregistré"}</div>`}
+    </div></div>`;
+}
+function addYears(d, n){ const x=new Date(d+"T12:00"); x.setFullYear(x.getFullYear()+n); return x.toISOString().slice(0,10); }
+function recordCheck(c){
+  dialog(`<p style="margin-bottom:12px"><b>${esc(c.label)} effectué${c.key==="exp"?"e":""}</b></p>
+    <div class="f"><label for="dDate">Date</label><input type="date" id="dDate" value="${today()}"></div>
+    <div class="f"><label for="dNote">Remarque</label><input id="dNote" placeholder="${esc(c.ph)}"></div>
+    <div class="f"><label for="dNext">Prochaine échéance</label><input type="date" id="dNext" value="">
+      <div class="chips" style="margin-top:8px">${[1,2,3,5].map(n=>`<button type="button" class="chip" data-add="${n}">+${n} an${n>1?"s":""}</button>`).join("")}</div></div>
+    <div class="row" style="margin:0"><button class="btn ghost" id="dNo">Annuler</button><button class="btn pri" id="dYes">Enregistrer</button></div>`);
+  $("#dlgbox").querySelectorAll("[data-add]").forEach(b=>b.onclick=()=>{ const base=$("#dDate").value||today(); $("#dNext").value=addYears(base,+b.dataset.add); });
+  $("#dNo").onclick=closeDialog;
+  $("#dYes").onclick=async()=>{
+    const date=$("#dDate").value; if(!date){ toast("Indiquez la date"); return; }
+    const hist=(profile[c.hist]||[]).concat([{date, note:$("#dNote").value.trim(), next:$("#dNext").value}]).sort((a,b)=>b.date.localeCompare(a.date));
+    const o=Object.assign({}, profile, {[c.hist]: hist});
+    if($("#dNext").value) o[c.next]=$("#dNext").value;
+    try{ await saveProfile(o); closeDialog(); toast("Ajouté à l'historique"); renderBoat(); }catch(e){ closeDialog(); toast("Enregistrement impossible"); }
+  };
 }
 
 /* ---------- Export ---------- */
 function renderExport(){
-  const cols=["date","type","depart","retour","portDepart","destination","portArrivee","skipper","nbPers","equipage","ciel","tempAir","tempEau","pression","visibilite","ventDir","beaufort","ventNd","rafales","mer","motSortie","motEntree","motAutre","compteur","carburant","distance","vmax","voiles","notes"];
+  const cols=["date","type","depart","retour","portDepart","destination","portArrivee","skipper","nbPers","equipage","ciel","tempAir","tempEau","visibilite","ventDir","beaufort","ventNd","rafales","mer","motSortie","motEntree","motAutre","compteur","carburant","voiles","notes","photos"];
   const csv = [cols.join(";")].concat(entries.slice().sort((a,b)=>(a.date||"").localeCompare(b.date||"")).map(e=>cols.map(c=>{
-    let v = c==="voiles" ? (e.voiles||[]).join(", ") : (e[c]??"");
+    let v = c==="voiles" ? (e.voiles||[]).join(", ") : c==="photos" ? (e.photos||[]).length : (e[c]??"");
     v = String(v).replace(/"/g,'""'); return /[;"\n]/.test(v) ? `"${v}"` : v;
   }).join(";"))).join("\n");
   const last = lsGet("ldb_lastBackup", null);
@@ -437,7 +668,10 @@ function renderExport(){
     <button class="btn ghost" id="csvBtn">Exporter en CSV</button></div>`;
 
   $("#bkp").onclick = async ()=>{
-    const ok = await shareOrDownload(backupJSON(), `livre-de-bord-${stamp()}.json`, "application/json");
+    $("#bkp").textContent = "Préparation…";
+    const content = await backupJSON();
+    $("#bkp").textContent = "Sauvegarder les données";
+    const ok = await shareOrDownload(content, `livre-de-bord-${stamp()}.json`, "application/json");
     if(ok){ try{ lsSet("ldb_lastBackup", new Date().toISOString()); }catch(e){} toast("Sauvegarde créée"); renderExport(); }
   };
   $("#csvBtn").onclick = ()=> shareOrDownload("﻿"+csv, `livre-de-bord-${stamp()}.csv`, "text/csv");
@@ -448,7 +682,9 @@ function renderExport(){
     let data;
     try{ data = JSON.parse(await file.text()); }catch(e){ toast("Fichier illisible"); return; }
     if(!data || data.app!=="livre-de-bord-voile" || !Array.isArray(data.entries)){ toast("Ce n'est pas une sauvegarde du livre de bord"); return; }
-    const inc = data.entries.filter(validEntry);
+    const pics = (data.photos && typeof data.photos==="object") ? data.photos : {};
+    const okPic = id => typeof id==="string" && /^p_[\w-]+$/.test(id) && pics[id] && typeof pics[id].full==="string" && pics[id].full.startsWith("data:image/") && typeof pics[id].thumb==="string" && pics[id].thumb.startsWith("data:image/");
+    const inc = data.entries.filter(validEntry).map(e=>Object.assign({}, e, {photos: Array.isArray(e.photos) ? e.photos.filter(okPic) : []}));
     const ids = new Set(entries.map(e=>e.id));
     const nouv = inc.filter(e=>!ids.has(e.id)).length;
     dialog(`<p><b>Restaurer ${inc.length} sortie(s) ?</b><br><span style="color:var(--muted);font-size:14px">Sauvegarde du ${esc(fmtDate(String(data.exported||"").slice(0,10),{day:"numeric",month:"long",year:"numeric"}))}. Vous avez actuellement ${entries.length} sortie(s).</span></p>
@@ -456,18 +692,34 @@ function renderExport(){
       <button class="btn danger" id="dReplace">Tout remplacer</button><div style="height:8px"></div>
       <button class="btn ghost" id="dNo">Annuler</button>`);
     $("#dNo").onclick = closeDialog;
-    const apply = (replace)=>{
+    const apply = async (replace)=>{
       const prevE = entries, prevP = profile;
+      $("#dlgbox").innerHTML = `<p><b>Restauration en cours…</b></p>`;
+      let picFail = 0;
+      for(const id of new Set(inc.flatMap(e=>e.photos))){
+        try{ await PDB.put(id, {full: pics[id].full, thumb: pics[id].thumb}); }catch(err){ picFail++; }
+      }
+      const inProf = (data.profile && typeof data.profile==="object" && !Array.isArray(data.profile)) ? data.profile : {};
       try{
-        if(replace){ entries = inc; profile = (data.profile && typeof data.profile==="object") ? data.profile : {}; }
+        if(replace){ entries = inc; profile = inProf; }
         else {
           const map = new Map(entries.map(e=>[e.id,e]));
           inc.forEach(e=>{ const cur=map.get(e.id); if(!cur || String(e.updated||"") > String(cur.updated||"")) map.set(e.id,e); });
           entries = [...map.values()];
-          if(data.profile && !profile.nom) profile = data.profile;
+          const p = Object.assign({}, inProf, profile);
+          CHECKS.forEach(c=>{
+            const all = [].concat(profile[c.hist]||[], Array.isArray(inProf[c.hist]) ? inProf[c.hist] : []);
+            const seen = new Set();
+            p[c.hist] = all.filter(h=>h && typeof h.date==="string" && !seen.has(h.date+"|"+(h.note||"")) && seen.add(h.date+"|"+(h.note||""))).sort((a,b)=>b.date.localeCompare(a.date));
+            if(!profile[c.next] && inProf[c.next]) p[c.next] = inProf[c.next];
+          });
+          profile = p;
         }
         lsSet("ldb_entries", entries); lsSet("ldb_profile", profile);
-        closeDialog(); toast(replace ? "Données restaurées" : "Sauvegarde fusionnée"); go("journal");
+        await gcPhotos();
+        closeDialog();
+        toast(picFail ? `Restauré, mais ${picFail} photo(s) n'ont pas pu être copiées` : (replace ? "Données restaurées" : "Sauvegarde fusionnée"));
+        go("journal");
       }catch(e){ entries=prevE; profile=prevP; closeDialog(); toast("Restauration impossible : stockage plein ou bloqué"); }
     };
     $("#dMerge").onclick = ()=>apply(false);
